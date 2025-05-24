@@ -1,14 +1,153 @@
 #!/bin/sh
-# OpenWrt Pure fq_codel Gaming QoS - 完整管理脚本
-# 集成配置、检查、监控功能
+# QoS(fq_codel) 流量控制脚本
 
+# 配置文件路径
+CONFIG_FILE="/etc/config/qos"
+
+# 默认接口
 WAN_IF="eth1"
-UPLOAD_MBPS=50    # 实际上传速度
-DOWNLOAD_MBPS=100 # 实际下载速度
 
-# fq_codel 能很好处理缓冲区膨胀，可以设置更接近实际速度
-UPLOAD_KBPS=$((UPLOAD_MBPS * 900))
-DOWNLOAD_KBPS=$((DOWNLOAD_MBPS * 950))
+# 读取配置文件
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        . "$CONFIG_FILE"
+    else
+        # 如果配置文件不存在，询问用户输入
+        setup_config
+    fi
+    
+    # 计算实际限速值 - fq_codel 能很好处理缓冲区膨胀，可以设置更接近实际速度
+    UPLOAD_KBPS=$((UPLOAD_MBPS * 900))
+    DOWNLOAD_KBPS=$((DOWNLOAD_MBPS * 950))
+}
+
+# 初始配置设置
+setup_config() {
+    echo "=========================================="
+    echo "        QoS 初始配置向导"
+    echo "=========================================="
+    echo ""
+    
+    # 显示当前可用的网络接口
+    echo "当前系统可用的网络接口："
+    echo "----------------------------------------"
+    if command -v ip >/dev/null 2>&1; then
+        ip link show | grep -E "^[0-9]+:" | awk -F': ' '{print "  " $2}' | sed 's/@.*//'
+    else
+        # 备用方法，如果ip命令不可用
+        if [ -d "/sys/class/net" ]; then
+            for iface in /sys/class/net/*; do
+                echo "  $(basename "$iface")"
+            done
+        else
+            echo "  无法自动检测，常见接口名: eth0, eth1, wan, pppoe-wan"
+        fi
+    fi
+    echo "----------------------------------------"
+    echo ""
+    
+    # 询问网络接口
+    while true; do
+        printf "请输入WAN接口名称 (默认: eth1): "
+        read input_interface
+        
+        # 如果用户直接按回车，使用默认值
+        if [ -z "$input_interface" ]; then
+            WAN_IF="eth1"
+            break
+        fi
+        
+        # 验证接口名称格式（简单验证）
+        if echo "$input_interface" | grep -q '^[a-zA-Z][a-zA-Z0-9-]*[0-9]*$'; then
+            WAN_IF="$input_interface"
+            break
+        else
+            echo "❌ 请输入有效的接口名称"
+        fi
+    done
+    
+    echo ""
+    echo "请输入您的网络连接实际速度："
+    echo ""
+    
+    # 询问上传速度
+    while true; do
+        printf "请输入实际上传速度 (单位: Mbps): "
+        read UPLOAD_MBPS
+        
+        # 验证输入是否为数字
+        if echo "$UPLOAD_MBPS" | grep -q '^[0-9]\+$' && [ "$UPLOAD_MBPS" -gt 0 ]; then
+            break
+        else
+            echo "❌ 请输入有效的数字 (大于0)"
+        fi
+    done
+    
+    # 询问下载速度
+    while true; do
+        printf "请输入实际下载速度 (单位: Mbps): "
+        read DOWNLOAD_MBPS
+        
+        # 验证输入是否为数字
+        if echo "$DOWNLOAD_MBPS" | grep -q '^[0-9]\+$' && [ "$DOWNLOAD_MBPS" -gt 0 ]; then
+            break
+        else
+            echo "❌ 请输入有效的数字 (大于0)"
+        fi
+    done
+    
+    # 确认配置
+    echo ""
+    echo "配置确认："
+    echo "  网络接口: ${WAN_IF}"
+    echo "  上传速度: ${UPLOAD_MBPS} Mbps"
+    echo "  下载速度: ${DOWNLOAD_MBPS} Mbps"
+    echo "  QoS限速: 上传 $((UPLOAD_MBPS * 900)) Kbps / 下载 $((DOWNLOAD_MBPS * 950)) Kbps"
+    echo ""
+    
+    while true; do
+        printf "确认保存此配置? (y/n): "
+        read confirm
+        case "$confirm" in
+            [Yy]|[Yy][Ee][Ss])
+                save_config
+                echo "✅ 配置已保存到 $CONFIG_FILE"
+                break
+                ;;
+            [Nn]|[Nn][Oo])
+                echo "配置已取消，请重新运行脚本"
+                exit 0
+                ;;
+            *)
+                echo "请输入 y 或 n"
+                ;;
+        esac
+    done
+}
+
+# 保存配置到文件
+save_config() {
+    # 确保目录存在
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    
+    # 写入配置文件
+    cat > "$CONFIG_FILE" << EOF
+# QoS 配置文件
+# 由 qos 脚本自动生成于 $(date)
+
+# 网络接口
+WAN_IF="$WAN_IF"
+
+# 实际网络速度 (Mbps)
+UPLOAD_MBPS=$UPLOAD_MBPS
+DOWNLOAD_MBPS=$DOWNLOAD_MBPS
+
+# 配置创建时间
+CONFIG_CREATED="$(date)"
+EOF
+    
+    chmod 644 "$CONFIG_FILE"
+}
 
 # 颜色定义
 RED='\033[0;31m'
@@ -19,6 +158,20 @@ NC='\033[0m' # No Color
 
 # 启用QoS功能
 start_qos() {
+    # 加载配置
+    load_config
+    
+    # 检查接口是否存在
+    if ! ip link show "$WAN_IF" >/dev/null 2>&1; then
+        echo "❌ 错误: 网络接口 '$WAN_IF' 不存在"
+        echo ""
+        echo "当前可用的网络接口："
+        ip link show | grep -E "^[0-9]+:" | awk -F': ' '{print "  " $2}' | sed 's/@.*//'
+        echo ""
+        echo "请使用 '$0 reconfig' 重新配置正确的接口"
+        exit 1
+    fi
+    
     echo "启用fq_codel QoS: $WAN_IF 上传${UPLOAD_KBPS}kbps 下载${DOWNLOAD_KBPS}kbps"
 
     # 清理现有配置
@@ -45,6 +198,11 @@ start_qos() {
 
 # 停止QoS功能
 stop_qos() {
+    # 加载配置以获取正确的接口名
+    if [ -f "$CONFIG_FILE" ]; then
+        . "$CONFIG_FILE"
+    fi
+    
     echo "正在停止QoS..."
     tc qdisc del dev $WAN_IF root 2>/dev/null
     tc qdisc del dev $WAN_IF ingress 2>/dev/null
@@ -55,6 +213,9 @@ stop_qos() {
 
 # 重置统计数据
 reset_stats() {
+    # 加载配置
+    load_config
+    
     echo "正在重置QoS统计数据..."
     
     # 保存当前配置参数
@@ -79,6 +240,11 @@ reset_stats() {
 
 # 快速状态检查
 check_qos() {
+    # 加载配置以获取正确的接口名
+    if [ -f "$CONFIG_FILE" ]; then
+        . "$CONFIG_FILE"
+    fi
+    
     printf "QoS 状态检查 - $(date '+%H:%M:%S')\n"
     printf "========================================\n"
 
@@ -247,6 +413,11 @@ get_qos_stats() {
 
 # 主监控循环
 main_monitor() {
+    # 加载配置以获取正确的接口名
+    if [ -f "$CONFIG_FILE" ]; then
+        . "$CONFIG_FILE"
+    fi
+    
     # 检查是否需要重置统计数据
     if [ "$2" = "reset" ] || [ "$2" = "clean" ]; then
         echo "准备开始监控，正在重置统计数据..."
@@ -297,15 +468,53 @@ main_monitor() {
     done
 }
 
-# 一次性显示模式
-show_once() {
-    clear_screen
-    printf "${GREEN}QoS 状态快照 - $(date '+%Y-%m-%d %H:%M:%S')${NC}\n\n"
+# 重新配置网络速度
+reconfig_speed() {
+    echo "=========================================="
+    echo "        重新配置QoS参数"
+    echo "=========================================="
+    echo ""
     
-    get_qos_stats $WAN_IF "上传"
+    # 显示当前配置
+    if [ -f "$CONFIG_FILE" ]; then
+        load_config
+        echo "当前配置："
+        echo "  网络接口: ${WAN_IF}"
+        echo "  上传速度: ${UPLOAD_MBPS} Mbps"
+        echo "  下载速度: ${DOWNLOAD_MBPS} Mbps"
+        echo ""
+    fi
     
-    if ip link show ifb0 >/dev/null 2>&1; then
-        get_qos_stats ifb0 "下载"
+    setup_config
+    
+    # 如果QoS正在运行，重启以应用新配置
+    if tc qdisc show dev $WAN_IF | grep -q "qdisc tbf"; then
+        echo ""
+        echo "检测到QoS正在运行，正在重启以应用新配置..."
+        stop_qos
+        sleep 1
+        start_qos
+    fi
+}
+
+# 显示当前配置
+show_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        load_config
+        echo "=========================================="
+        echo "        当前QoS配置"
+        echo "=========================================="
+        echo "配置文件: $CONFIG_FILE"
+        echo "网络接口: $WAN_IF"
+        echo "上传速度: ${UPLOAD_MBPS} Mbps (限速: ${UPLOAD_KBPS} Kbps)"
+        echo "下载速度: ${DOWNLOAD_MBPS} Mbps (限速: ${DOWNLOAD_KBPS} Kbps)"
+        if [ -n "$CONFIG_CREATED" ]; then
+            echo "创建时间: $CONFIG_CREATED"
+        fi
+        echo "=========================================="
+    else
+        echo "❌ 配置文件不存在: $CONFIG_FILE"
+        echo "请先运行 '$0 start' 进行初始配置"
     fi
 }
 
@@ -316,18 +525,21 @@ show_help() {
     echo "用法: $0 [命令] [选项]"
     echo ""
     echo "命令:"
-    echo "  start        - 启用QoS配置"
+    echo "  start        - 启用QoS配置（首次运行会进行配置向导）"
     echo "  stop         - 停止QoS配置"
     echo "  restart      - 重启QoS配置"
     echo "  check        - 快速状态检查"
     echo "  monitor      - 实时监控模式（保留历史数据）"
     echo "  monitor reset- 实时监控模式（重置统计数据）"
     echo "  reset        - 重置统计数据"
-    echo "  once         - 显示一次状态快照"
+    echo "  config       - 显示当前配置"
+    echo "  reconfig     - 重新配置QoS参数（接口和速度）"
     echo "  help         - 显示此帮助信息"
     echo ""
     echo "示例:"
-    echo "  $0 start     - 启用QoS"
+    echo "  $0 start     - 启用QoS（首次运行会询问接口和网络速度）"
+    echo "  $0 config    - 查看当前配置"
+    echo "  $0 reconfig  - 重新设置接口和网络速度"
     echo "  $0 monitor   - 启动实时监控（保留历史数据）"
     echo "  $0 monitor reset - 启动实时监控（先重置统计数据）"
     echo "  $0 check     - 快速检查状态"
@@ -343,6 +555,7 @@ case "$1" in
         echo "  实时监控: $0 monitor"
         echo "  快速检查: $0 check"
         echo "  停止QoS:  $0 stop"
+        echo "  查看配置: $0 config"
         ;;
     "stop")
         stop_qos
@@ -359,6 +572,7 @@ case "$1" in
         printf "快速命令:\n"
         printf "  详细监控: $0 monitor\n"
         printf "  停止QoS:  $0 stop\n"
+        printf "  查看配置: $0 config\n"
         ;;
     "monitor")
         main_monitor "$@"
@@ -366,8 +580,11 @@ case "$1" in
     "reset")
         reset_stats
         ;;
-    "once")
-        show_once
+    "config")
+        show_config
+        ;;
+    "reconfig")
+        reconfig_speed
         ;;
     "help"|"-h"|"--help")
         show_help
