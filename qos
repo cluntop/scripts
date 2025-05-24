@@ -16,9 +16,17 @@ load_config() {
         setup_config
     fi
     
+    # 验证配置变量是否为有效数字
+    case "$UPLOAD_MBPS" in ''|*[!0-9]*) UPLOAD_MBPS=10 ;; esac
+    case "$DOWNLOAD_MBPS" in ''|*[!0-9]*) DOWNLOAD_MBPS=50 ;; esac
+    
+    # 确保配置变量不为空
+    : ${UPLOAD_MBPS:=10}
+    : ${DOWNLOAD_MBPS:=50}
+    
     # 计算实际限速值 - fq_codel 能很好处理缓冲区膨胀，可以设置更接近实际速度
-    UPLOAD_KBPS=$((UPLOAD_MBPS * 900))
-    DOWNLOAD_KBPS=$((DOWNLOAD_MBPS * 950))
+    UPLOAD_KBPS=$(( UPLOAD_MBPS * 900 ))
+    DOWNLOAD_KBPS=$(( DOWNLOAD_MBPS * 950 ))
 }
 
 # 初始配置设置
@@ -425,23 +433,31 @@ clear_screen() {
 format_bytes() {
     local bytes=$1
     
-    if [ $bytes -gt 1073741824 ]; then
+    # 输入验证
+    case "$bytes" in
+        ''|*[!0-9]*) bytes=0 ;;
+    esac
+    
+    # 确保是正整数
+    bytes=${bytes:-0}
+    
+    if [ "$bytes" -gt 1073741824 ]; then
         # GB计算
         local gb=$((bytes / 1073741824))
         local remainder=$((bytes % 1073741824))
-        local decimal=$((remainder * 100 / 1073741824))
+        local decimal=$(( (remainder * 100) / 1073741824 ))
         printf "%d.%02dGB" $gb $decimal
-    elif [ $bytes -gt 1048576 ]; then
+    elif [ "$bytes" -gt 1048576 ]; then
         # MB计算
         local mb=$((bytes / 1048576))
         local remainder=$((bytes % 1048576))
-        local decimal=$((remainder * 100 / 1048576))
+        local decimal=$(( (remainder * 100) / 1048576 ))
         printf "%d.%02dMB" $mb $decimal
-    elif [ $bytes -gt 1024 ]; then
+    elif [ "$bytes" -gt 1024 ]; then
         # KB计算
         local kb=$((bytes / 1024))
         local remainder=$((bytes % 1024))
-        local decimal=$((remainder * 100 / 1024))
+        local decimal=$(( (remainder * 100) / 1024 ))
         printf "%d.%02dKB" $kb $decimal
     else
         printf "%dB" $bytes
@@ -465,34 +481,67 @@ get_game_queue_stats() {
     local interface=$1
     local direction=$2
     
-    # 获取队列统计
-    local fq_stats=$(tc -s qdisc show dev $interface | grep -A 5 "qdisc fq_codel")
-    local tbf_stats=$(tc -s qdisc show dev $interface | grep -A 3 "qdisc tbf")
+    # 获取完整的tc统计输出
+    local tc_output=$(tc -s qdisc show dev $interface 2>/dev/null)
+    
+    # 提取fq_codel和tbf统计数据
+    local fq_stats=$(echo "$tc_output" | grep -A 10 "qdisc fq_codel")
+    local tbf_stats=$(echo "$tc_output" | grep -A 5 "qdisc tbf")
     
     if [ -z "$fq_stats" ]; then
         print_status "error" "未找到 $direction fq_codel队列配置"
         return
     fi
     
-    # 提取关键数据
-    local rate=$(echo "$tbf_stats" | grep "qdisc tbf" | grep -o "rate [^ ]*" | cut -d' ' -f2)
-    local sent_bytes=$(echo "$fq_stats" | grep "Sent" | grep -o "Sent [0-9]*" | cut -d' ' -f2)
-    local sent_packets=$(echo "$fq_stats" | grep "Sent" | grep -o "Sent [0-9]* bytes [0-9]*" | awk '{print $4}')
-    local dropped=$(echo "$fq_stats" | grep "dropped" | grep -o "dropped [0-9]*" | cut -d' ' -f2)
-    local old_flows=$(echo "$fq_stats" | grep "old_flows" | grep -o "old_flows [0-9]*" | cut -d' ' -f2)
-    local new_flows=$(echo "$fq_stats" | grep "new_flows" | grep -o "new_flows [0-9]*" | cut -d' ' -f2)
+    # 改进的数据提取 - 更精确的正则表达式
+    local rate=$(echo "$tbf_stats" | grep "qdisc tbf" | sed -n 's/.*rate \([0-9]*[KMG]*bit\).*/\1/p')
     
-    # 默认值处理
+    # 提取发送的字节数和包数 - 处理多种tc输出格式
+    local sent_line=$(echo "$fq_stats" | grep "Sent")
+    local sent_bytes=$(echo "$sent_line" | sed -n 's/.*Sent \([0-9]\+\) bytes.*/\1/p')
+    local sent_packets=$(echo "$sent_line" | sed -n 's/.*bytes \([0-9]\+\) pkt.*/\1/p')
+    
+    # 提取丢包数 - 支持多种格式
+    local dropped=$(echo "$fq_stats" | grep -o "dropped [0-9]\+" | cut -d' ' -f2)
+    
+    # 提取流数据
+    local old_flows=$(echo "$fq_stats" | grep -o "old_flows [0-9]\+" | cut -d' ' -f2)
+    local new_flows=$(echo "$fq_stats" | grep -o "new_flows [0-9]\+" | cut -d' ' -f2)
+    
+    # 默认值处理 - 确保都是有效数字
     sent_bytes=${sent_bytes:-0}
     sent_packets=${sent_packets:-0}
     dropped=${dropped:-0}
     old_flows=${old_flows:-0}
     new_flows=${new_flows:-0}
     
-    # 计算丢包率 (百分比)
+    # 增强的数据验证 - 确保都是数字
+    case "$sent_bytes" in ''|*[!0-9]*) sent_bytes=0 ;; esac
+    case "$sent_packets" in ''|*[!0-9]*) sent_packets=0 ;; esac
+    case "$dropped" in ''|*[!0-9]*) dropped=0 ;; esac
+    case "$old_flows" in ''|*[!0-9]*) old_flows=0 ;; esac
+    case "$new_flows" in ''|*[!0-9]*) new_flows=0 ;; esac
+    
+    # 额外的安全检查：确保变量不为空
+    : ${sent_bytes:=0}
+    : ${sent_packets:=0}
+    : ${dropped:=0}
+    
+    # 改进的丢包率计算 - 更严格的数值验证
     local drop_rate=0
-    if [ $sent_packets -gt 0 ] && [ $dropped -gt 0 ]; then
-        drop_rate=$(( (dropped * 10000) / (sent_packets + dropped) ))  # 百分比*100
+    local total_attempts=0
+    
+    # 只有在确保数值有效的情况下才进行计算
+    if [ "$sent_packets" -gt 0 ] || [ "$dropped" -gt 0 ]; then
+        # 确保加法安全
+        if [ "$sent_packets" -ge 0 ] && [ "$dropped" -ge 0 ]; then
+            total_attempts=$((sent_packets + dropped))
+            # 只有在总数大于0且丢包数大于0时才计算丢包率
+            if [ "$total_attempts" -gt 0 ] && [ "$dropped" -gt 0 ]; then
+                # 防止除零错误，使用更安全的算术
+                drop_rate=$(( (dropped * 10000) / total_attempts ))
+            fi
+        fi
     fi
     
     # 游戏性能状态判断
@@ -526,15 +575,23 @@ get_game_queue_stats() {
         elif [ $drop_rate -lt 500 ]; then  # 1-5%
             game_status="✅ 积极流控"
             status_color="$GREEN"
-            drop_rate_display=$(printf "丢包率: %d.%02d%%" $((drop_rate/100)) $((drop_rate%100)))
+            drop_rate_display=$(printf "丢包率: %d.%02d%%" $(( drop_rate / 100 )) $(( drop_rate % 100 )))
         elif [ $drop_rate -lt 1000 ]; then  # 5-10%
             game_status="⚠️  重度流控"
             status_color="$YELLOW"
-            drop_rate_display=$(printf "丢包率: %d.%02d%%" $((drop_rate/100)) $((drop_rate%100)))
-        else  # >10%
+            drop_rate_display=$(printf "丢包率: %d.%02d%%" $(( drop_rate / 100 )) $(( drop_rate % 100 )))
+        elif [ $drop_rate -lt 2000 ]; then  # 10-20%
+            game_status="⚠️  高强度流控"
+            status_color="$YELLOW"
+            drop_rate_display=$(printf "丢包率: %d.%02d%% (bulk流量被限制)" $(( drop_rate / 100 )) $(( drop_rate % 100 )))
+        elif [ $drop_rate -lt 3000 ]; then  # 20-30%
+            game_status="🎮 游戏保护模式"
+            status_color="$CYAN"
+            drop_rate_display=$(printf "丢包率: %d.%02d%% (QoS保护游戏)" $(( drop_rate / 100 )) $(( drop_rate % 100 )))
+        else  # >30%
             game_status="❌ 过度丢包"
             status_color="$RED"
-            drop_rate_display=$(printf "丢包率: %d.%02d%%" $((drop_rate/100)) $((drop_rate%100)))
+            drop_rate_display=$(printf "丢包率: %d.%02d%% (可能影响游戏)" $(( drop_rate / 100 )) $(( drop_rate % 100 )))
         fi
     fi
     
@@ -542,6 +599,13 @@ get_game_queue_stats() {
     printf "${PURPLE}  🎮 %s游戏队列${NC}\n" "$direction"
     printf "${PURPLE}══════════════════════════════════════════════════════════════${NC}\n"
     printf "  带宽: ${YELLOW}%s${NC} | 总流量: ${GREEN}%s${NC}\n" "$(format_rate $rate)" "$(format_bytes $sent_bytes)"
+    
+    # 显示平均包大小信息
+    if [ "$sent_packets" -gt 0 ] && [ "$sent_bytes" -gt 0 ]; then
+        # 安全的除法运算，确保都是正数
+        local avg_packet_size=$(( sent_bytes / sent_packets ))
+        printf "  📦 平均包大小: ${CYAN}%d bytes${NC}\n" $avg_packet_size
+    fi
     
     if [ "$direction" = "下载" ]; then
         printf "  ${CYAN}%s${NC}\n" "$drop_rate_display"
@@ -556,8 +620,8 @@ get_game_queue_stats() {
 # 显示监控状态说明
 show_monitor_legend() {
     printf "${PURPLE}════════════════════════════════════════════════════════════════${NC}\n"
-    printf "  ${GREEN}✅ 流畅/流控${NC} | ${YELLOW}⚠️ 注意${NC} | ${RED}❌ 问题${NC}\n"
-    printf "  ${CYAN}💡 下载丢包率1-5%% = QoS优先保障游戏${NC}\n"
+    printf "  ${CYAN}💡 下载丢包率10-30%% = fq_codel 保护游戏流量${NC}\n"
+    printf "  ${CYAN}🎯 游戏包通常＜100字节，bulk流量＞1000字节${NC}\n"
     printf "  ${YELLOW}按 Ctrl+C 退出监控${NC}\n"
 }
 
@@ -690,7 +754,6 @@ show_help() {
     printf "  ${CYAN}%s monitor${NC}   - 🎮 实时监控游戏队列\n" "$0"
 }
 
-# 参数处理
 case "$1" in
     "start")
         start_qos
