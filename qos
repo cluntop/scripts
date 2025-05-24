@@ -24,7 +24,7 @@ load_config() {
 # 初始配置设置
 setup_config() {
     echo "=========================================="
-    echo "        QoS 初始配置向导"
+    echo "            QoS 初始配置向导"
     echo "=========================================="
     echo ""
     
@@ -238,64 +238,6 @@ reset_stats() {
     fi
 }
 
-# 快速状态检查
-check_qos() {
-    # 加载配置以获取正确的接口名
-    if [ -f "$CONFIG_FILE" ]; then
-        . "$CONFIG_FILE"
-    fi
-    
-    printf "QoS 状态检查 - $(date '+%H:%M:%S')\n"
-    printf "========================================\n"
-
-    # 检查上传队列
-    echo "【上传队列 - $WAN_IF】"
-    upload_stats=$(tc -s qdisc show dev $WAN_IF | grep -A 3 "qdisc tbf")
-    if [ -n "$upload_stats" ]; then
-        rate=$(echo "$upload_stats" | grep "rate" | grep -o "rate [^b]*" | cut -d' ' -f2)
-        dropped=$(echo "$upload_stats" | grep "dropped" | grep -o "dropped [0-9]*" | cut -d' ' -f2)
-        overlimits=$(echo "$upload_stats" | grep "overlimits" | grep -o "overlimits [0-9]*" | cut -d' ' -f2)
-        
-        printf "  速率限制: %s\n" "$rate"
-        printf "  丢包: %s | 超限: %s\n" "${dropped:-0}" "${overlimits:-0}"
-        
-        if [ "${dropped:-0}" -gt 100 ] || [ "${overlimits:-0}" -gt 1000 ]; then
-            printf "  状态: ⚠️  需要关注\n"
-        else
-            printf "  状态: ✅ 正常\n"
-        fi
-    else
-        printf "  状态: ❌ 未配置\n"
-    fi
-
-    echo ""
-
-    # 检查下载队列
-    echo "【下载队列 - ifb0】"
-    if ip link show ifb0 >/dev/null 2>&1; then
-        download_stats=$(tc -s qdisc show dev ifb0 | grep -A 3 "qdisc tbf")
-        if [ -n "$download_stats" ]; then
-            rate=$(echo "$download_stats" | grep "rate" | grep -o "rate [^b]*" | cut -d' ' -f2)
-            dropped=$(echo "$download_stats" | grep "dropped" | grep -o "dropped [0-9]*" | cut -d' ' -f2)
-            overlimits=$(echo "$download_stats" | grep "overlimits" | grep -o "overlimits [0-9]*" | cut -d' ' -f2)
-            backlog=$(echo "$download_stats" | grep "backlog" | grep -o "backlog [0-9]*b" | cut -d' ' -f2 | sed 's/b//')
-            
-            printf "  速率限制: %s\n" "$rate"
-            printf "  丢包: %s | 超限: %s | 积压: %s字节\n" "${dropped:-0}" "${overlimits:-0}" "${backlog:-0}"
-            
-            if [ "${dropped:-0}" -gt 1000 ] || [ "${overlimits:-0}" -gt 10000 ] || [ "${backlog:-0}" -gt 50000 ]; then
-                printf "  状态: ⚠️  需要调整\n"
-            else
-                printf "  状态: ✅ 正常\n"
-            fi
-        else
-            printf "  状态: ❌ 未配置\n"
-        fi
-    else
-        printf "  状态: ❌ ifb0 接口不存在\n"
-    fi
-}
-
 # 清屏函数
 clear_screen() {
     printf '\033[2J\033[H'
@@ -342,76 +284,70 @@ get_status_color() {
     fi
 }
 
-# 获取QoS统计信息
-get_qos_stats() {
+# 获取游戏队列统计信息
+get_game_queue_stats() {
     local interface=$1
     local direction=$2
     
-    # 获取TBF统计
-    local tbf_stats=$(tc -s qdisc show dev $interface | grep -A 3 "qdisc tbf")
+    # 获取FQ_CODEL游戏队列统计
     local fq_stats=$(tc -s qdisc show dev $interface | grep -A 5 "qdisc fq_codel")
+    local tbf_stats=$(tc -s qdisc show dev $interface | grep -A 3 "qdisc tbf")
     
-    if [ -z "$tbf_stats" ]; then
-        echo "${RED}未找到 $direction 队列配置${NC}"
+    if [ -z "$fq_stats" ]; then
+        echo "${RED}未找到 $direction fq_codel队列配置${NC}"
         return
     fi
     
-    # 提取关键数据
+    # 提取关键游戏数据
     local rate=$(echo "$tbf_stats" | grep "qdisc tbf" | grep -o "rate [^ ]*" | cut -d' ' -f2)
-    local sent_bytes=$(echo "$tbf_stats" | grep "Sent" | grep -o "Sent [0-9]*" | cut -d' ' -f2)
-    local sent_packets=$(echo "$tbf_stats" | grep "Sent" | grep -o "[0-9]* pkt" | cut -d' ' -f1)
-    local dropped=$(echo "$tbf_stats" | grep "dropped" | grep -o "dropped [0-9]*" | cut -d' ' -f2)
-    local overlimits=$(echo "$tbf_stats" | grep "overlimits" | grep -o "overlimits [0-9]*" | cut -d' ' -f2)
-    local backlog_bytes=$(echo "$tbf_stats" | grep "backlog" | grep -o "backlog [0-9]*b" | cut -d' ' -f2 | sed 's/b//')
-    local backlog_packets=$(echo "$tbf_stats" | grep "backlog" | grep -o "[0-9]*p" | sed 's/p//')
-    
-    # FQ_CODEL 特定信息
-    local fq_dropped=$(echo "$fq_stats" | grep "Sent" | grep -o "dropped [0-9]*" | cut -d' ' -f2)
-    local new_flows=$(echo "$fq_stats" | grep "new_flow_count" | grep -o "new_flow_count [0-9]*" | cut -d' ' -f2)
-    local memory_used=$(echo "$fq_stats" | grep "memory_used" | grep -o "memory_used [0-9]*" | cut -d' ' -f2)
+    local sent_bytes=$(echo "$fq_stats" | grep "Sent" | grep -o "Sent [0-9]*" | cut -d' ' -f2)
+    local dropped=$(echo "$fq_stats" | grep "dropped" | grep -o "dropped [0-9]*" | cut -d' ' -f2)
+    local old_flows=$(echo "$fq_stats" | grep "old_flows" | grep -o "old_flows [0-9]*" | cut -d' ' -f2)
+    local new_flows=$(echo "$fq_stats" | grep "new_flows" | grep -o "new_flows [0-9]*" | cut -d' ' -f2)
     
     # 默认值处理
     [ -z "$dropped" ] && dropped=0
-    [ -z "$overlimits" ] && overlimits=0
-    [ -z "$backlog_bytes" ] && backlog_bytes=0
-    [ -z "$backlog_packets" ] && backlog_packets=0
-    [ -z "$fq_dropped" ] && fq_dropped=0
+    [ -z "$old_flows" ] && old_flows=0
     [ -z "$new_flows" ] && new_flows=0
-    [ -z "$memory_used" ] && memory_used=0
     
-    # 状态判断
-    local status_color=$(get_status_color $dropped $overlimits $backlog_bytes)
+    # 游戏性能状态判断
+    local game_status=""
+    local status_color=""
     
-    printf "${BLUE}══════════════════════════════════════════════════════════════${NC}\n"
-    printf "${BLUE}  %s 方向流量控制状态${NC}\n" "$direction"
-    printf "${BLUE}══════════════════════════════════════════════════════════════${NC}\n"
-    printf "  限制速率: ${YELLOW}%s${NC}\n" "$(format_rate $rate)"
-    printf "  总流量:   ${GREEN}%s${NC} (%s 包)\n" "$(format_bytes $sent_bytes)" "$sent_packets"
-    printf "  丢包数:   ${status_color}%s${NC}\n" "$dropped"
-    printf "  超限次数: ${status_color}%s${NC}\n" "$overlimits"
-    printf "  队列积压: ${status_color}%s (%s 包)${NC}\n" "$(format_bytes $backlog_bytes)" "$backlog_packets"
-    
-    if [ ! -z "$new_flows" ] && [ "$new_flows" != "0" ]; then
-        printf "  新流计数: ${GREEN}%s${NC}\n" "$new_flows"
-    fi
-    
-    if [ ! -z "$memory_used" ] && [ "$memory_used" != "0" ]; then
-        printf "  内存使用: ${GREEN}%s${NC}\n" "$(format_bytes $memory_used)"
-    fi
-    
-    # 状态评估
-    printf "  状态评估: "
-    if [ $dropped -gt 1000 ] || [ $overlimits -gt 10000 ]; then
-        printf "${RED}需要调整 - 丢包/超限过多${NC}\n"
-    elif [ $backlog_bytes -gt 50000 ]; then
-        printf "${YELLOW}轻微拥塞 - 队列积压较多${NC}\n"
+    if [ "$direction" = "上传" ]; then
+        if [ $dropped -gt 50 ]; then
+            game_status="❌ 可能卡顿"
+            status_color="$RED"
+        elif [ $dropped -gt 10 ]; then
+            game_status="⚠️  偶有延迟"
+            status_color="$YELLOW"
+        else
+            game_status="✅ 流畅"
+            status_color="$GREEN"
+        fi
     else
-        printf "${GREEN}运行良好${NC}\n"
+        if [ $dropped -gt 100 ]; then
+            game_status="❌ 下载影响游戏"
+            status_color="$RED"
+        elif [ $dropped -gt 20 ]; then
+            game_status="⚠️  轻微影响"
+            status_color="$YELLOW"
+        else
+            game_status="✅ 流畅"
+            status_color="$GREEN"
+        fi
     fi
+    
+    printf "${BLUE}══════════════════════════════════════════════════════════════${NC}\n"
+    printf "${BLUE}  🎮 %s游戏队列${NC}\n" "$direction"
+    printf "${BLUE}══════════════════════════════════════════════════════════════${NC}\n"
+    printf "  带宽: ${YELLOW}%s${NC} | 总流量: ${GREEN}%s${NC}\n" "$(format_rate $rate)" "$(format_bytes $sent_bytes)"
+    printf "  ${GREEN}活跃%s/1024流${NC} | ${CYAN}新流%s${NC} | 丢包: ${RED}%s${NC}\n" "$old_flows" "$new_flows" "$dropped"
+    printf "  游戏状态: ${status_color}%s${NC}\n" "$game_status"
     printf "\n"
 }
 
-# 主监控循环
+# 游戏队列监控循环
 main_monitor() {
     # 加载配置以获取正确的接口名
     if [ -f "$CONFIG_FILE" ]; then
@@ -420,51 +356,44 @@ main_monitor() {
     
     # 检查是否需要重置统计数据
     if [ "$2" = "reset" ] || [ "$2" = "clean" ]; then
-        echo "准备开始监控，正在重置统计数据..."
+        echo "准备开始游戏队列监控，正在重置统计数据..."
         reset_stats
         sleep 2
     else
-        echo "启动监控模式（保留历史数据）..."
-        echo "提示: 使用 '$0 monitor reset' 可重置统计数据后监控"
+        echo "🎮 启动游戏队列监控..."
         sleep 1
     fi
     
     while true; do
         clear_screen
         
-        printf "${GREEN}╔════════════════════════════════════════════════════════════════╗${NC}\n"
-        printf "${GREEN}║                    QoS 流量控制实时监控                        ║${NC}\n"
-        printf "${GREEN}║                   $(date '+%Y-%m-%d %H:%M:%S')                   ║${NC}\n"
-        printf "${GREEN}╚════════════════════════════════════════════════════════════════╝${NC}\n\n"
+        printf "${GREEN}╔═══════════════════════════════════════════════════════════════╗${NC}\n"
+        printf "${GREEN}║                   🎮 游戏队列监控                             ║${NC}\n"
+        printf "${GREEN}║                   $(date '+%Y-%m-%d %H:%M:%S')                  ║${NC}\n"
+        printf "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}\n\n"
         
         # 检查QoS是否启用
-        if ! tc qdisc show dev $WAN_IF | grep -q "qdisc tbf"; then
-            printf "${RED}❌ QoS 未启用或配置错误${NC}\n"
+        if ! tc qdisc show dev $WAN_IF | grep -q "qdisc fq_codel"; then
+            printf "${RED}❌ 游戏队列未启用${NC}\n"
             printf "${YELLOW}请先运行 $0 start 启用QoS${NC}\n"
             exit 1
         fi
         
-        # 显示上传统计
-        get_qos_stats $WAN_IF "上传"
+        # 显示游戏队列统计
+        get_game_queue_stats $WAN_IF "上传"
         
-        # 显示下载统计
         if ip link show ifb0 >/dev/null 2>&1; then
-            get_qos_stats ifb0 "下载"
+            get_game_queue_stats ifb0 "下载"
         else
-            printf "${RED}❌ 下载队列 (ifb0) 未配置${NC}\n\n"
+            printf "${RED}❌ 下载游戏队列未配置${NC}\n\n"
         fi
         
-        # 显示建议
-        printf "${BLUE}══════════════════════════════════════════════════════════════${NC}\n"
-        printf "${BLUE}  优化建议${NC}\n"
-        printf "${BLUE}══════════════════════════════════════════════════════════════${NC}\n"
-        printf "  🔹 ${GREEN}绿色${NC}: 运行良好，无需调整\n"
-        printf "  🔸 ${YELLOW}黄色${NC}: 轻微问题，可考虑微调\n" 
-        printf "  🔴 ${RED}红色${NC}: 需要调整带宽或算法参数\n"
-        printf "\n"
+        # 显示简单提示
+        printf "${BLUE}════════════════════════════════════════════════════════════════${NC}\n"
+        printf "  ${GREEN}✅ 流畅${NC} | ${YELLOW}⚠️ 偶有延迟${NC} | ${RED}❌ 可能卡顿${NC}\n"
         printf "  ${YELLOW}按 Ctrl+C 退出监控${NC}\n"
         
-        sleep 2
+        sleep 3
     done
 }
 
@@ -520,30 +449,27 @@ show_config() {
 
 # 显示帮助信息
 show_help() {
-    echo "OpenWrt fq_codel QoS 完整管理脚本"
+    echo "OpenWrt fq_codel QoS 游戏优化脚本"
     echo ""
-    echo "用法: $0 [命令] [选项]"
+    echo "用法: $0 [命令]"
     echo ""
-    echo "命令:"
-    echo "  start        - 启用QoS配置（首次运行会进行配置向导）"
-    echo "  stop         - 停止QoS配置"
-    echo "  restart      - 重启QoS配置"
-    echo "  check        - 快速状态检查"
-    echo "  monitor      - 实时监控模式（保留历史数据）"
-    echo "  monitor reset- 实时监控模式（重置统计数据）"
-    echo "  reset        - 重置统计数据"
+    echo "基本命令:"
+    echo "  start        - 启用QoS（首次运行会配置向导）"
+    echo "  stop         - 停止QoS"
+    echo "  restart      - 重启QoS"
+    echo ""
+    echo "🎮 游戏监控:"
+    echo "  monitor      - 游戏队列实时监控"
+    echo "  monitor reset- 重置数据后监控"
+    echo ""
+    echo "配置管理:"
     echo "  config       - 显示当前配置"
-    echo "  reconfig     - 重新配置QoS参数（接口和速度）"
-    echo "  help         - 显示此帮助信息"
+    echo "  reconfig     - 重新配置网速和接口"
+    echo "  reset        - 重置统计数据"
     echo ""
     echo "示例:"
-    echo "  $0 start     - 启用QoS（首次运行会询问接口和网络速度）"
-    echo "  $0 config    - 查看当前配置"
-    echo "  $0 reconfig  - 重新设置接口和网络速度"
-    echo "  $0 monitor   - 启动实时监控（保留历史数据）"
-    echo "  $0 monitor reset - 启动实时监控（先重置统计数据）"
-    echo "  $0 check     - 快速检查状态"
-    echo "  $0 stop      - 停止QoS"
+    echo "  $0 start     - 启用游戏优化QoS"
+    echo "  $0 monitor   - 🎮 实时监控游戏队列"
 }
 
 # 参数处理
@@ -551,11 +477,10 @@ case "$1" in
     "start")
         start_qos
         echo ""
-        echo "📊 快速命令:"
-        echo "  实时监控: $0 monitor"
-        echo "  快速检查: $0 check"
-        echo "  停止QoS:  $0 stop"
-        echo "  查看配置: $0 config"
+        echo "🎮 游戏优化命令:"
+        echo "  游戏队列监控: $0 monitor"
+        echo "  停止QoS:      $0 stop"
+        echo "  查看配置:     $0 config"
         ;;
     "stop")
         stop_qos
@@ -565,14 +490,6 @@ case "$1" in
         echo "等待1秒..."
         sleep 1
         start_qos
-        ;;
-    "check")
-        check_qos
-        echo ""
-        printf "快速命令:\n"
-        printf "  详细监控: $0 monitor\n"
-        printf "  停止QoS:  $0 stop\n"
-        printf "  查看配置: $0 config\n"
         ;;
     "monitor")
         main_monitor "$@"
