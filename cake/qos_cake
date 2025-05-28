@@ -1,0 +1,1003 @@
+#!/bin/sh
+# QoS(CAKE) 流量控制脚本
+
+# 配置文件路径
+CONFIG_FILE="/etc/config/qos_cake"
+
+# 默认接口
+WAN_IF="eth1"
+
+# 读取配置文件
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        . "$CONFIG_FILE"
+    else
+        # 如果配置文件不存在，询问用户输入
+        setup_config
+    fi
+    
+    # 验证配置变量是否为有效数字
+    case "$UPLOAD_MBPS" in ''|*[!0-9]*) UPLOAD_MBPS=10 ;; esac
+    case "$DOWNLOAD_MBPS" in ''|*[!0-9]*) DOWNLOAD_MBPS=50 ;; esac
+    
+    # 确保配置变量不为空
+    : ${UPLOAD_MBPS:=10}
+    : ${DOWNLOAD_MBPS:=50}
+    
+    # CAKE 计算实际限速值 - CAKE 有更好的缓冲区管理，可以设置更接近实际速度
+    UPLOAD_KBPS=$(( UPLOAD_MBPS * 950 ))  # 95% 用于上传
+    DOWNLOAD_KBPS=$(( DOWNLOAD_MBPS * 980 )) # 98% 用于下载
+    
+    # CAKE 特有配置
+    : ${CAKE_OVERHEAD:=18}  # PPPoE = 18, Ethernet = 14
+    : ${CAKE_DIFFSERV:=diffserv4}  # diffserv4 为游戏优化
+    : ${CAKE_NAT:=nat}     # 启用NAT检测
+    : ${CAKE_ACK_FILTER:=ack-filter}  # 启用ACK过滤
+}
+
+# 初始配置设置
+setup_config() {
+    print_header "CAKE QoS 初始配置向导"
+    
+    print_section "当前系统可用的网络接口"
+    detect_interfaces
+    echo ""
+    
+    # 询问网络接口
+    while true; do
+        printf "请输入WAN接口名称 (默认: eth1): "
+        read input_interface
+        
+        if [ -z "$input_interface" ]; then
+            WAN_IF="eth1"
+            break
+        elif validate_interface "$input_interface"; then
+            WAN_IF="$input_interface"
+            break
+        else
+            print_status "error" "请输入有效的接口名称"
+        fi
+    done
+    
+    echo ""
+    print_section "网络连接类型配置"
+    print_status "info" "CAKE 可以自动优化不同连接类型的开销"
+    printf "  1) PPPoE 连接 (开销: 18 bytes)\n"
+    printf "  2) 以太网连接 (开销: 14 bytes)\n"
+    printf "  3) 自定义开销\n"
+    echo ""
+    
+    while true; do
+        printf "请选择连接类型 (1-3, 默认: 1): "
+        read connection_type
+        
+        case "${connection_type:-1}" in
+            1)
+                CAKE_OVERHEAD=18
+                print_status "success" "已选择 PPPoE 连接 (开销: 18 bytes)"
+                break
+                ;;
+            2)
+                CAKE_OVERHEAD=14
+                print_status "success" "已选择以太网连接 (开销: 14 bytes)"
+                break
+                ;;
+            3)
+                while true; do
+                    printf "请输入自定义开销值 (0-64): "
+                    read custom_overhead
+                    if validate_number "$custom_overhead" 0 && [ "$custom_overhead" -le 64 ]; then
+                        CAKE_OVERHEAD=$custom_overhead
+                        print_status "success" "已设置自定义开销: $custom_overhead bytes"
+                        break 2
+                    else
+                        print_status "error" "请输入 0-64 之间的数字"
+                    fi
+                done
+                ;;
+            *)
+                print_status "error" "请输入 1-3 之间的数字"
+                ;;
+        esac
+    done
+    
+    echo ""
+    print_section "QoS 优化配置"
+    print_status "info" "CAKE 支持多种游戏优化特性"
+    
+    # 询问是否启用 DiffServ
+    if ask_yes_no "启用 DiffServ4 游戏流量优先级?" "y"; then
+        CAKE_DIFFSERV="diffserv4"
+        print_status "success" "已启用 DiffServ4 (游戏包将获得更高优先级)"
+    else
+        CAKE_DIFFSERV="besteffort"
+        print_status "info" "使用最佳努力模式"
+    fi
+    
+    # 询问是否启用 NAT 检测
+    if ask_yes_no "启用 NAT 检测优化?" "y"; then
+        CAKE_NAT="nat"
+        print_status "success" "已启用 NAT 检测"
+    else
+        CAKE_NAT="nonat"
+        print_status "info" "禁用 NAT 检测"
+    fi
+    
+    # 询问是否启用 ACK 过滤
+    if ask_yes_no "启用 ACK 过滤 (减少上传ACK包冲突)?" "y"; then
+        CAKE_ACK_FILTER="ack-filter"
+        print_status "success" "已启用 ACK 过滤"
+    else
+        CAKE_ACK_FILTER="no-ack-filter"
+        print_status "info" "禁用 ACK 过滤"
+    fi
+    
+    echo ""
+    print_section "网络内核优化推荐"
+    print_status "info" "启用 BBR 拥塞控制算法"
+    print_status "info" "优化 TCP 缓冲区大小"
+    print_status "info" "减少网络延迟和抖动"
+    print_status "info" "提升游戏连接稳定性"
+    echo ""
+    
+    # 询问是否应用sysctl优化
+    if ask_yes_no "是否应用推荐的网络内核优化参数?" "y"; then
+        APPLY_SYSCTL="yes"
+    else
+        APPLY_SYSCTL="no"
+    fi
+    
+    echo ""
+    print_section "网络速度配置"
+    
+    # 询问上传速度
+    while true; do
+        printf "请输入实际上传速度 (单位: Mbps): "
+        read UPLOAD_MBPS
+        
+        if validate_number "$UPLOAD_MBPS"; then
+            break
+        else
+            print_status "error" "请输入有效的数字 (大于0)"
+        fi
+    done
+    
+    # 询问下载速度
+    while true; do
+        printf "请输入实际下载速度 (单位: Mbps): "
+        read DOWNLOAD_MBPS
+        
+        if validate_number "$DOWNLOAD_MBPS"; then
+            break
+        else
+            print_status "error" "请输入有效的数字 (大于0)"
+        fi
+    done
+    
+    # 确认配置
+    echo ""
+    print_section "配置确认"
+    printf "  网络接口: ${CYAN}%s${NC}\n" "$WAN_IF"
+    printf "  连接开销: ${CYAN}%s bytes${NC}\n" "$CAKE_OVERHEAD"
+    printf "  DiffServ: ${CYAN}%s${NC}\n" "$CAKE_DIFFSERV"
+    printf "  NAT检测: ${CYAN}%s${NC}\n" "$CAKE_NAT"
+    printf "  ACK过滤: ${CYAN}%s${NC}\n" "$CAKE_ACK_FILTER"
+    printf "  上传速度: ${CYAN}%s Mbps${NC}\n" "$UPLOAD_MBPS"
+    printf "  下载速度: ${CYAN}%s Mbps${NC}\n" "$DOWNLOAD_MBPS"
+    printf "  CAKE限速: 上传 ${YELLOW}%s Kbps${NC} / 下载 ${YELLOW}%s Kbps${NC}\n" "$((UPLOAD_MBPS * 950))" "$((DOWNLOAD_MBPS * 980))"
+    
+    if [ "$APPLY_SYSCTL" = "yes" ]; then
+        print_status "success" "将应用推荐的内核优化参数"
+    else
+        print_status "warning" "跳过内核优化参数"
+    fi
+    echo ""
+    
+    if ask_yes_no "确认保存此配置?"; then
+        save_config
+        print_status "success" "配置已保存到 $CONFIG_FILE"
+        
+        if [ "$APPLY_SYSCTL" = "yes" ]; then
+            apply_sysctl_optimizations
+        fi
+    else
+        print_status "error" "配置已取消，请重新运行脚本"
+        exit 0
+    fi
+}
+
+# 保存配置到文件
+save_config() {
+    # 确保目录存在
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    
+    # 写入配置文件
+    cat > "$CONFIG_FILE" << EOF
+# CAKE QoS 配置文件
+# 由 qos_cake 脚本自动生成于 $(date)
+
+# 网络接口
+WAN_IF="$WAN_IF"
+
+# 实际网络速度 (Mbps)
+UPLOAD_MBPS=$UPLOAD_MBPS
+DOWNLOAD_MBPS=$DOWNLOAD_MBPS
+
+# CAKE 特有配置
+CAKE_OVERHEAD=$CAKE_OVERHEAD
+CAKE_DIFFSERV="$CAKE_DIFFSERV"
+CAKE_NAT="$CAKE_NAT"
+CAKE_ACK_FILTER="$CAKE_ACK_FILTER"
+
+# sysctl优化选项
+APPLY_SYSCTL="$APPLY_SYSCTL"
+
+# 配置创建时间
+CONFIG_CREATED="$(date)"
+EOF
+    
+    chmod 644 "$CONFIG_FILE"
+}
+
+# 应用sysctl网络优化参数 (针对CAKE优化)
+apply_sysctl_optimizations() {
+    echo ""
+    print_status "info" "正在应用CAKE优化的网络内核参数..."
+    
+    # 备份并清理现有sysctl配置
+    if [ -f "/etc/sysctl.conf" ]; then
+        backup_file="/etc/sysctl.conf.bak.$(date +%Y%m%d_%H%M%S)"
+        print_status "info" "备份现有 /etc/sysctl.conf 到 $backup_file"
+        cp /etc/sysctl.conf "$backup_file" 2>/dev/null
+        rm -f /etc/sysctl.conf
+    fi
+    
+    if [ -d "/etc/sysctl.d" ]; then
+        if ls /etc/sysctl.d/*.conf >/dev/null 2>&1; then
+            backup_dir="/tmp/sysctl.d.bak.$(date +%Y%m%d_%H%M%S)"
+            print_status "info" "备份现有配置到 $backup_dir"
+            mkdir -p "$backup_dir"
+            cp /etc/sysctl.d/*.conf "$backup_dir/" 2>/dev/null
+        fi
+        rm -rf /etc/sysctl.d
+        mkdir -p /etc/sysctl.d
+    else
+        mkdir -p /etc/sysctl.d
+    fi
+    
+    # 创建针对CAKE优化的sysctl配置
+    cat > /etc/sysctl.d/99-cake-qos-optimizations.conf << 'EOF'
+# CAKE QoS 优化参数
+# 默认队列算法 - CAKE 与 BBR 配合最佳
+net.core.default_qdisc = cake
+net.ipv4.tcp_congestion_control = bbr
+
+# TCP缓冲区优化 - 为CAKE调优
+net.ipv4.tcp_rmem = 8192 131072 33554432
+net.ipv4.tcp_wmem = 4096 87380 33554432
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+
+# CAKE 配合 BBR 的窗口优化
+net.ipv4.tcp_shrink_window = 1
+net.ipv4.tcp_adv_win_scale = 2
+net.ipv4.tcp_window_scaling = 1
+
+# 端口范围和连接优化
+net.ipv4.ip_local_port_range = 1024 65535
+net.core.somaxconn = 8192
+net.core.netdev_max_backlog = 8192
+net.ipv4.tcp_max_tw_buckets = 65536
+
+# TCP连接行为优化 - CAKE友好
+net.ipv4.tcp_abort_on_overflow = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_fack = 1
+
+# SYN处理优化
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 3
+net.ipv4.tcp_max_syn_backlog = 8192
+
+# 连接超时优化 - 游戏友好
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_keepalive_time = 300
+
+# 重传和错误恢复 - 快速恢复
+net.ipv4.tcp_retries1 = 3
+net.ipv4.tcp_retries2 = 5
+net.ipv4.tcp_frto = 2
+net.ipv4.tcp_no_metrics_save = 1
+
+# 转发和BBR调整 - CAKE适配
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+net.ipv4.tcp_pacing_ca_ratio = 120
+net.ipv4.tcp_pacing_ss_ratio = 200
+
+# CAKE 特定优化
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.ipv4.tcp_moderate_rcvbuf = 1
+
+# 文件系统优化
+fs.file-max = 104857600
+fs.inotify.max_user_instances = 8192
+fs.nr_open = 1048576
+EOF
+    
+    # 应用配置
+    print_status "info" "应用sysctl配置..."
+    sysctl -p /etc/sysctl.d/99-cake-qos-optimizations.conf >/dev/null 2>&1
+    
+    # 验证关键参数
+    echo ""
+    print_section "验证关键优化参数"
+    
+    # 检查BBR
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [ "$current_cc" = "bbr" ]; then
+        print_status "success" "BBR拥塞控制已启用"
+    else
+        print_status "warning" "BBR拥塞控制可能需要内核支持"
+    fi
+    
+    # 检查CAKE
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    if [ "$current_qdisc" = "cake" ]; then
+        print_status "success" "CAKE队列已设为默认"
+    else
+        print_status "warning" "CAKE队列设置完成"
+    fi
+    
+    # 检查转发
+    ipv4_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
+    if [ "$ipv4_forward" = "1" ]; then
+        print_status "success" "IPv4转发已启用"
+    else
+        print_status "warning" "IPv4转发需要手动启用"
+    fi
+    
+    echo ""
+    print_status "success" "CAKE优化参数已应用到 /etc/sysctl.d/99-cake-qos-optimizations.conf"
+    print_status "info" "参数将在下次重启后永久生效"
+}
+
+# 颜色和UI定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# UI辅助函数
+print_header() {
+    printf "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}\n"
+    printf "${GREEN}${BOLD}║ %-60s ║${NC}\n" "$1"
+    printf "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}\n"
+    echo ""
+}
+
+print_section() {
+    printf "${PURPLE}══════════════════════════════════════════════════════════════${NC}\n"
+    printf "${PURPLE}  %s${NC}\n" "$1"
+    printf "${PURPLE}══════════════════════════════════════════════════════════════${NC}\n"
+}
+
+print_status() {
+    local status=$1
+    local message=$2
+    case "$status" in
+        "success") printf "  ${GREEN}✅ %s${NC}\n" "$message" ;;
+        "warning") printf "  ${YELLOW}⚠️  %s${NC}\n" "$message" ;;
+        "error")   printf "  ${RED}❌ %s${NC}\n" "$message" ;;
+        "info")    printf "  ${PURPLE}ℹ️  %s${NC}\n" "$message" ;;
+    esac
+}
+
+# 统一的接口检测函数
+detect_interfaces() {
+    if command -v ip >/dev/null 2>&1; then
+        ip link show | grep -E "^[0-9]+:" | awk -F': ' '{print "  " $2}' | sed 's/@.*//'
+    elif [ -d "/sys/class/net" ]; then
+        for iface in /sys/class/net/*; do
+            echo "  $(basename "$iface")"
+        done
+    else
+        echo "  无法自动检测，常见接口名: eth0, eth1, wan, pppoe-wan"
+    fi
+}
+
+# 输入验证函数
+validate_number() {
+    local input=$1
+    local min=${2:-1}
+    echo "$input" | grep -q '^[0-9]\+$' && [ "$input" -ge "$min" ]
+}
+
+validate_interface() {
+    local interface=$1
+    echo "$interface" | grep -q '^[a-zA-Z][a-zA-Z0-9-]*[0-9]*$'
+}
+
+# 用户确认函数
+ask_yes_no() {
+    local question=$1
+    local default=${2:-""}
+    
+    while true; do
+        if [ -n "$default" ]; then
+            printf "%s (y/n, 默认: %s): " "$question" "$default"
+        else
+            printf "%s (y/n): " "$question"
+        fi
+        
+        read answer
+        
+        # 如果有默认值且用户直接回车
+        if [ -z "$answer" ] && [ -n "$default" ]; then
+            answer=$default
+        fi
+        
+        case "$answer" in
+            [Yy]|[Yy][Ee][Ss]) return 0 ;;
+            [Nn]|[Nn][Oo]) return 1 ;;
+            *) echo "请输入 y 或 n" ;;
+        esac
+    done
+}
+
+# 检查CAKE支持
+check_cake_support() {
+    # 首先检查内核模块是否可用
+    if ! lsmod | grep -q "sch_cake" 2>/dev/null; then
+        print_status "info" "正在尝试加载 CAKE 内核模块..."
+        if ! modprobe sch_cake 2>/dev/null; then
+            print_status "error" "无法加载 CAKE 内核模块"
+            print_status "info" "请确保内核编译时包含 CONFIG_NET_SCH_CAKE=y"
+            print_status "info" "或安装支持CAKE的内核模块"
+            exit 1
+        fi
+        print_status "success" "CAKE 内核模块已加载"
+    else
+        print_status "success" "CAKE 内核模块已存在"
+    fi
+    
+    # 验证模块加载成功后再检查tc工具支持
+    if ! tc qdisc help 2>&1 | grep -q "cake"; then
+        print_status "warning" "tc 工具可能不完全支持 CAKE，但内核模块已加载"
+        print_status "info" "将尝试继续配置，如果失败请更新 tc 工具包"
+    fi
+}
+
+# 启用CAKE QoS功能
+start_qos() {
+    load_config
+    check_cake_support
+    
+    # 检查接口是否存在
+    if ! ip link show "$WAN_IF" >/dev/null 2>&1; then
+        print_status "error" "网络接口 '$WAN_IF' 不存在"
+        echo ""
+        print_section "当前可用的网络接口"
+        detect_interfaces
+        echo ""
+        print_status "info" "请使用 '$0 reconfig' 重新配置正确的接口"
+        exit 1
+    fi
+    
+    print_status "info" "启用CAKE QoS: $WAN_IF 上传${UPLOAD_KBPS}kbps 下载${DOWNLOAD_KBPS}kbps"
+    print_status "info" "CAKE参数: overhead $CAKE_OVERHEAD $CAKE_DIFFSERV $CAKE_NAT $CAKE_ACK_FILTER"
+
+    # 清理现有配置
+    tc qdisc del dev $WAN_IF root 2>/dev/null
+    tc qdisc del dev $WAN_IF ingress 2>/dev/null
+    tc qdisc del dev ifb0 root 2>/dev/null
+    ip link del ifb0 2>/dev/null
+
+    # 配置上传CAKE队列 - 游戏优化
+    tc qdisc add dev $WAN_IF root cake \
+        bandwidth ${UPLOAD_KBPS}kbit \
+        overhead $CAKE_OVERHEAD \
+        $CAKE_DIFFSERV \
+        $CAKE_NAT \
+        $CAKE_ACK_FILTER \
+        rtt 25ms \
+        noatm
+
+    # 配置下载CAKE队列 - 使用IFB设备
+    modprobe ifb
+    ip link add name ifb0 type ifb 2>/dev/null
+    ip link set dev ifb0 up
+    tc qdisc add dev $WAN_IF ingress
+    tc filter add dev $WAN_IF parent ffff: protocol all u32 match u32 0 0 flowid 1:1 action mirred egress redirect dev ifb0
+    
+    tc qdisc add dev ifb0 root cake \
+        bandwidth ${DOWNLOAD_KBPS}kbit \
+        overhead $CAKE_OVERHEAD \
+        $CAKE_DIFFSERV \
+        $CAKE_NAT \
+        ingress \
+        rtt 25ms \
+        noatm
+
+    print_status "success" "CAKE QoS配置完成"
+    
+    # 显示CAKE特有的状态信息
+    echo ""
+    print_section "CAKE 特性状态"
+    
+    if [ "$CAKE_DIFFSERV" = "diffserv4" ]; then
+        print_status "success" "DiffServ4: 游戏包自动获得高优先级"
+    fi
+    
+    if [ "$CAKE_ACK_FILTER" = "ack-filter" ]; then
+        print_status "success" "ACK过滤: 减少ACK包在上传队列的冲突"
+    fi
+    
+    if [ "$CAKE_NAT" = "nat" ]; then
+        print_status "success" "NAT检测: 自动识别和优化NAT连接"
+    fi
+}
+
+# 停止QoS功能
+stop_qos() {
+    load_config
+    
+    print_status "info" "正在停止CAKE QoS..."
+    tc qdisc del dev $WAN_IF root 2>/dev/null
+    tc qdisc del dev $WAN_IF ingress 2>/dev/null
+    tc qdisc del dev ifb0 root 2>/dev/null
+    ip link del ifb0 2>/dev/null
+    print_status "success" "CAKE QoS已停止"
+}
+
+# 重置统计数据
+reset_stats() {
+    load_config
+    
+    print_status "info" "正在重置CAKE统计数据..."
+    
+    # 检查现有配置
+    if tc qdisc show dev $WAN_IF | grep -q "qdisc cake" && ip link show ifb0 >/dev/null 2>&1; then
+        print_status "info" "检测到现有CAKE配置，重新应用以清除统计数据..."
+        stop_qos
+        sleep 1
+        start_qos
+        print_status "success" "统计数据已重置"
+    else
+        print_status "warning" "未检测到CAKE配置，无需重置"
+    fi
+}
+
+# 清屏函数
+clear_screen() {
+    printf '\033[2J\033[H'
+}
+
+# 格式化字节数
+format_bytes() {
+    local bytes=$1
+    
+    # 输入验证
+    case "$bytes" in
+        ''|*[!0-9]*) bytes=0 ;;
+    esac
+    
+    # 确保是正整数
+    bytes=${bytes:-0}
+    
+    if [ "$bytes" -gt 1073741824 ]; then
+        # GB计算
+        local gb=$((bytes / 1073741824))
+        local remainder=$((bytes % 1073741824))
+        local decimal=$(( (remainder * 100) / 1073741824 ))
+        printf "%d.%02dGB" $gb $decimal
+    elif [ "$bytes" -gt 1048576 ]; then
+        # MB计算
+        local mb=$((bytes / 1048576))
+        local remainder=$((bytes % 1048576))
+        local decimal=$(( (remainder * 100) / 1048576 ))
+        printf "%d.%02dMB" $mb $decimal
+    elif [ "$bytes" -gt 1024 ]; then
+        # KB计算
+        local kb=$((bytes / 1024))
+        local remainder=$((bytes % 1024))
+        local decimal=$(( (remainder * 100) / 1024 ))
+        printf "%d.%02dKB" $kb $decimal
+    else
+        printf "%dB" $bytes
+    fi
+}
+
+# 格式化速率
+format_rate() {
+    local rate=$1
+    if echo "$rate" | grep -q "Mbit"; then
+        echo "$rate" | sed 's/Mbit/Mbps/'
+    elif echo "$rate" | grep -q "Kbit"; then
+        echo "$rate" | sed 's/Kbit/Kbps/'
+    else
+        echo "$rate"
+    fi
+}
+
+# 获取CAKE队列统计信息
+get_cake_queue_stats() {
+    local interface=$1
+    local direction=$2
+    
+    # 获取完整的tc统计输出
+    local tc_output=$(tc -s qdisc show dev $interface 2>/dev/null)
+    
+    # 提取CAKE统计数据
+    local cake_stats=$(echo "$tc_output" | grep -A 20 "qdisc cake")
+    
+    if [ -z "$cake_stats" ]; then
+        print_status "error" "未找到 $direction CAKE队列配置"
+        return
+    fi
+    
+    # 提取基本统计数据
+    local sent_line=$(echo "$cake_stats" | grep "Sent")
+    local sent_bytes=$(echo "$sent_line" | sed -n 's/.*Sent \([0-9]\+\) bytes.*/\1/p')
+    local sent_packets=$(echo "$sent_line" | sed -n 's/.*bytes \([0-9]\+\) pkt.*/\1/p')
+    
+    # 提取CAKE特有的统计数据
+    local dropped=$(echo "$cake_stats" | grep -o "dropped [0-9]\+" | cut -d' ' -f2)
+    local overlimits=$(echo "$cake_stats" | grep -o "overlimits [0-9]\+" | cut -d' ' -f2)
+    local requeues=$(echo "$cake_stats" | grep -o "requeues [0-9]\+" | cut -d' ' -f2)
+    
+    # CAKE特有的延迟和队列统计
+    local memory_used=$(echo "$cake_stats" | grep -o "memory used: [0-9]*b" | cut -d' ' -f3 | sed 's/b$//')
+    local capacity=$(echo "$cake_stats" | grep -o "capacity estimate: [0-9]*[KMG]*bit" | cut -d' ' -f3)
+    
+    # DiffServ统计 (如果启用)
+    local bulk_flows=""
+    local normal_flows=""
+    local video_flows=""
+    local voice_flows=""
+    
+    if [ "$CAKE_DIFFSERV" = "diffserv4" ]; then
+        bulk_flows=$(echo "$cake_stats" | grep -o "Bulk[[:space:]]*[0-9]*" | awk '{print $2}')
+        normal_flows=$(echo "$cake_stats" | grep -o "Normal[[:space:]]*[0-9]*" | awk '{print $2}')
+        video_flows=$(echo "$cake_stats" | grep -o "Video[[:space:]]*[0-9]*" | awk '{print $2}')
+        voice_flows=$(echo "$cake_stats" | grep -o "Voice[[:space:]]*[0-9]*" | awk '{print $2}')
+    fi
+    
+    # 默认值处理
+    sent_bytes=${sent_bytes:-0}
+    sent_packets=${sent_packets:-0}
+    dropped=${dropped:-0}
+    overlimits=${overlimits:-0}
+    requeues=${requeues:-0}
+    memory_used=${memory_used:-0}
+    
+    # 数据验证
+    case "$sent_bytes" in ''|*[!0-9]*) sent_bytes=0 ;; esac
+    case "$sent_packets" in ''|*[!0-9]*) sent_packets=0 ;; esac
+    case "$dropped" in ''|*[!0-9]*) dropped=0 ;; esac
+    case "$overlimits" in ''|*[!0-9]*) overlimits=0 ;; esac
+    case "$requeues" in ''|*[!0-9]*) requeues=0 ;; esac
+    case "$memory_used" in ''|*[!0-9]*) memory_used=0 ;; esac
+    
+    # 计算丢包率
+    local drop_rate=0
+    local total_attempts=0
+    
+    if [ "$sent_packets" -gt 0 ] || [ "$dropped" -gt 0 ]; then
+        if [ "$sent_packets" -ge 0 ] && [ "$dropped" -ge 0 ]; then
+            total_attempts=$((sent_packets + dropped))
+            if [ "$total_attempts" -gt 0 ] && [ "$dropped" -gt 0 ]; then
+                drop_rate=$(( (dropped * 10000) / total_attempts ))
+            fi
+        fi
+    fi
+    
+    # CAKE特有的游戏性能状态判断
+    local game_status=""
+    local status_color=""
+    local drop_rate_display=""
+    
+    if [ "$direction" = "上传" ]; then
+        # 上传：CAKE的智能队列管理
+        if [ $overlimits -gt 1000 ]; then
+            game_status="🍰 CAKE主动流控"
+            status_color="$CYAN"
+            drop_rate_display="流控事件: $overlimits"
+        elif [ $dropped -gt 50 ]; then
+            game_status="⚠️  网络拥塞"
+            status_color="$YELLOW"
+            drop_rate_display="丢包: $dropped"
+        elif [ $dropped -gt 10 ]; then
+            game_status="✅ 轻微调控"
+            status_color="$GREEN"
+            drop_rate_display="丢包: $dropped"
+        else
+            game_status="✅ 畅通无阻"
+            status_color="$GREEN"
+            drop_rate_display="丢包: $dropped"
+        fi
+    else
+        # 下载：CAKE的智能带宽管理
+        if [ $overlimits -gt 2000 ]; then
+            game_status="🍰 CAKE保护游戏"
+            status_color="$CYAN"
+            drop_rate_display="带宽保护: ${overlimits}次"
+        elif [ $drop_rate -eq 0 ]; then
+            game_status="✅ 带宽充足"
+            status_color="$GREEN"
+            drop_rate_display="无丢包"
+        elif [ $drop_rate -lt 100 ]; then
+            game_status="✅ 智能调控"
+            status_color="$GREEN"
+            drop_rate_display=$(printf "丢包率: 0.%02d%%" $drop_rate)
+        elif [ $drop_rate -lt 500 ]; then
+            game_status="🍰 积极优化"
+            status_color="$CYAN"
+            drop_rate_display=$(printf "丢包率: %d.%02d%%" $(( drop_rate / 100 )) $(( drop_rate % 100 )))
+        else
+            game_status="⚠️  高负载"
+            status_color="$YELLOW"
+            drop_rate_display=$(printf "丢包率: %d.%02d%%" $(( drop_rate / 100 )) $(( drop_rate % 100 )))
+        fi
+    fi
+    
+    printf "${PURPLE}══════════════════════════════════════════════════════════════${NC}\n"
+    printf "${PURPLE}  🍰 %s CAKE队列${NC}\n" "$direction"
+    printf "${PURPLE}══════════════════════════════════════════════════════════════${NC}\n"
+    
+    # 基本统计
+    if [ -n "$capacity" ]; then
+        printf "  带宽: ${YELLOW}%s${NC} (估算: ${CYAN}%s${NC}) | 总流量: ${GREEN}%s${NC}\n" "$(format_rate ${direction_limit:-unknown})" "$(format_rate $capacity)" "$(format_bytes $sent_bytes)"
+    else
+        printf "  带宽: ${YELLOW}%s${NC} | 总流量: ${GREEN}%s${NC}\n" "$(format_rate ${direction_limit:-unknown})" "$(format_bytes $sent_bytes)"
+    fi
+    
+    # 显示平均包大小
+    if [ "$sent_packets" -gt 0 ] && [ "$sent_bytes" -gt 0 ]; then
+        local avg_packet_size=$(( sent_bytes / sent_packets ))
+        printf "  📦 平均包大小: ${CYAN}%d bytes${NC} | 内存使用: ${PURPLE}%s${NC}\n" $avg_packet_size "$(format_bytes $memory_used)"
+    fi
+    
+    # 显示CAKE特有统计
+    printf "  ${CYAN}%s${NC} | 流控事件: ${YELLOW}%s${NC}\n" "$drop_rate_display" "$overlimits"
+    
+    # DiffServ流分类统计
+    if [ "$CAKE_DIFFSERV" = "diffserv4" ] && [ -n "$bulk_flows$normal_flows$video_flows$voice_flows" ]; then
+        printf "  🏷️  流分类: "
+        [ -n "$voice_flows" ] && [ "$voice_flows" -gt 0 ] && printf "语音:${GREEN}%s${NC} " "$voice_flows"
+        [ -n "$video_flows" ] && [ "$video_flows" -gt 0 ] && printf "视频:${CYAN}%s${NC} " "$video_flows"
+        [ -n "$normal_flows" ] && [ "$normal_flows" -gt 0 ] && printf "普通:${YELLOW}%s${NC} " "$normal_flows"
+        [ -n "$bulk_flows" ] && [ "$bulk_flows" -gt 0 ] && printf "批量:${PURPLE}%s${NC} " "$bulk_flows"
+        printf "\n"
+    fi
+    
+    printf "  游戏状态: ${status_color}%s${NC}\n" "$game_status"
+    printf "\n"
+}
+
+# 显示CAKE监控状态说明
+show_cake_monitor_legend() {
+    printf "${PURPLE}════════════════════════════════════════════════════════════════${NC}\n"
+    printf "  ${CYAN}🍰 CAKE智能流控: 自动区分游戏/下载流量${NC}\n"
+    printf "  ${CYAN}🏷️  DiffServ4: Voice>Video>Normal>Bulk 优先级${NC}\n"
+    printf "  ${CYAN}⚡ ACK过滤: 减少上传ACK包队列冲突${NC}\n"
+    printf "  ${YELLOW}按 Ctrl+C 退出监控${NC}\n"
+}
+
+# 检查CAKE状态
+check_cake_status() {
+    if ! tc qdisc show dev $WAN_IF | grep -q "qdisc cake"; then
+        print_status "error" "CAKE队列未启用"
+        print_status "warning" "请先运行 $0 start 启用CAKE QoS"
+        exit 1
+    fi
+}
+
+# CAKE队列监控循环
+main_monitor() {
+    load_config
+    
+    # 检查CAKE支持
+    check_cake_support
+    
+    # 检查是否需要重置统计数据
+    if [ "$2" = "reset" ] || [ "$2" = "clean" ]; then
+        print_status "info" "准备开始CAKE队列监控，正在重置统计数据..."
+        reset_stats
+        sleep 2
+    else
+        print_status "info" "🍰 启动CAKE队列监控..."
+        sleep 1
+    fi
+    
+    while true; do
+        clear_screen
+        
+        printf "${GREEN}╔═══════════════════════════════════════════════════════════════╗${NC}\n"
+        printf "${GREEN}║                   🍰 CAKE队列监控                             ║${NC}\n"
+        printf "${GREEN}║                   $(date '+%Y-%m-%d %H:%M:%S')                  ║${NC}\n"
+        printf "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}\n\n"
+        
+        # 检查CAKE状态
+        check_cake_status
+        
+        # 显示CAKE队列统计
+        get_cake_queue_stats $WAN_IF "上传"
+        
+        if ip link show ifb0 >/dev/null 2>&1; then
+            get_cake_queue_stats ifb0 "下载"
+        else
+            print_status "error" "下载CAKE队列未配置"
+            echo ""
+        fi
+        
+        # 显示CAKE特性说明
+        show_cake_monitor_legend
+        
+        sleep 3
+    done
+}
+
+# 重新配置网络速度
+reconfig_speed() {
+    print_header "重新配置CAKE QoS参数"
+    
+    # 显示当前配置
+    if [ -f "$CONFIG_FILE" ]; then
+        load_config
+        print_section "当前配置"
+        printf "  网络接口: ${CYAN}%s${NC}\n" "$WAN_IF"
+        printf "  连接开销: ${CYAN}%s bytes${NC}\n" "$CAKE_OVERHEAD"
+        printf "  DiffServ: ${CYAN}%s${NC}\n" "$CAKE_DIFFSERV"
+        printf "  NAT检测: ${CYAN}%s${NC}\n" "$CAKE_NAT"
+        printf "  ACK过滤: ${CYAN}%s${NC}\n" "$CAKE_ACK_FILTER"
+        printf "  上传速度: ${CYAN}%s Mbps${NC}\n" "$UPLOAD_MBPS"
+        printf "  下载速度: ${CYAN}%s Mbps${NC}\n" "$DOWNLOAD_MBPS"
+        echo ""
+    fi
+    
+    setup_config
+    
+    # 如果CAKE QoS正在运行，重启以应用新配置
+    if tc qdisc show dev $WAN_IF | grep -q "qdisc cake" 2>/dev/null; then
+        echo ""
+        print_status "info" "检测到CAKE QoS正在运行，正在重启以应用新配置..."
+        stop_qos
+        sleep 1
+        start_qos
+    fi
+}
+
+# 显示当前配置
+show_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        load_config
+        print_header "当前CAKE QoS配置"
+        
+        printf "配置文件: ${CYAN}%s${NC}\n" "$CONFIG_FILE"
+        printf "网络接口: ${CYAN}%s${NC}\n" "$WAN_IF"
+        printf "连接开销: ${CYAN}%s bytes${NC}\n" "$CAKE_OVERHEAD"
+        printf "DiffServ: ${CYAN}%s${NC}\n" "$CAKE_DIFFSERV"
+        printf "NAT检测: ${CYAN}%s${NC}\n" "$CAKE_NAT"
+        printf "ACK过滤: ${CYAN}%s${NC}\n" "$CAKE_ACK_FILTER"
+        printf "上传速度: ${CYAN}%s Mbps${NC} (限速: ${YELLOW}%s Kbps${NC})\n" "$UPLOAD_MBPS" "$UPLOAD_KBPS"
+        printf "下载速度: ${CYAN}%s Mbps${NC} (限速: ${YELLOW}%s Kbps${NC})\n" "$DOWNLOAD_MBPS" "$DOWNLOAD_KBPS"
+        
+        if [ "$APPLY_SYSCTL" = "yes" ]; then
+            print_status "success" "CAKE优化的内核参数已应用"
+        else
+            print_status "warning" "内核优化未应用"
+        fi
+        
+        if [ -n "$CONFIG_CREATED" ]; then
+            printf "创建时间: ${PURPLE}%s${NC}\n" "$CONFIG_CREATED"
+        fi
+        
+        echo ""
+        print_section "CAKE特性状态"
+        if [ "$CAKE_DIFFSERV" = "diffserv4" ]; then
+            print_status "success" "游戏流量优先级: Voice > Video > Normal > Bulk"
+        fi
+        
+        if [ "$CAKE_ACK_FILTER" = "ack-filter" ]; then
+            print_status "success" "智能ACK过滤: 减少上传队列ACK包冲突"
+        fi
+        
+        if [ "$CAKE_NAT" = "nat" ]; then
+            print_status "success" "NAT检测: 自动优化NAT环境下的流量"
+        fi
+        
+    else
+        print_status "error" "配置文件不存在: $CONFIG_FILE"
+        print_status "info" "请先运行 '$0 start' 进行初始配置"
+    fi
+}
+
+# 显示帮助信息
+show_help() {
+    print_header "OpenWrt CAKE QoS 游戏优化脚本"
+    
+    printf "${BOLD}用法:${NC} %s [命令]\n\n" "$0"
+    
+    print_section "基本命令"
+    printf "  ${GREEN}start${NC}        - 启用CAKE QoS\n"
+    printf "  ${GREEN}stop${NC}         - 停止CAKE QoS\n"
+    printf "  ${GREEN}restart${NC}      - 重启CAKE QoS\n\n"
+    
+    print_section "🍰 CAKE监控"
+    printf "  ${GREEN}monitor${NC}      - CAKE队列实时监控\n"
+    printf "  ${GREEN}monitor reset${NC}- 重置数据后监控\n\n"
+    
+    print_section "配置管理"
+    printf "  ${GREEN}config${NC}       - 显示当前CAKE配置\n"
+    printf "  ${GREEN}reconfig${NC}     - 重新配置CAKE参数\n"
+    printf "  ${GREEN}reset${NC}        - 重置统计数据\n"
+    printf "  ${GREEN}sysctl${NC}       - 应用CAKE优化的内核参数\n\n"
+    
+    print_section "CAKE特性"
+    printf "  ${CYAN}🏷️  DiffServ4${NC}     - 游戏包自动获得最高优先级\n"
+    printf "  ${CYAN}⚡ ACK过滤${NC}      - 智能处理上传ACK包冲突\n"
+    printf "  ${CYAN}🔍 NAT检测${NC}      - 自动优化NAT环境流量\n"
+    printf "  ${CYAN}🍰 智能队列${NC}     - 比fq_codel更先进的AQM算法\n\n"
+    
+    print_section "示例"
+    printf "  ${CYAN}%s start${NC}     - 启用CAKE游戏优化QoS\n" "$0"
+    printf "  ${CYAN}%s monitor${NC}   - 🍰 实时监控CAKE队列\n" "$0"
+}
+
+case "$1" in
+    "start")
+        start_qos
+        echo ""
+        print_section "🍰 CAKE优化命令"
+        print_status "info" "CAKE队列监控: $0 monitor"
+        print_status "info" "停止QoS:      $0 stop"
+        print_status "info" "查看配置:     $0 config"
+        ;;
+    "stop")
+        stop_qos
+        ;;
+    "restart")
+        stop_qos
+        print_status "info" "等待1秒..."
+        sleep 1
+        start_qos
+        ;;
+    "monitor")
+        main_monitor "$@"
+        ;;
+    "reset")
+        reset_stats
+        ;;
+    "config")
+        show_config
+        ;;
+    "reconfig")
+        reconfig_speed
+        ;;
+    "sysctl")
+        print_status "info" "正在应用CAKE优化的网络内核参数..."
+        APPLY_SYSCTL="yes"
+        apply_sysctl_optimizations
+        ;;
+    "help"|"-h"|"--help")
+        show_help
+        ;;
+    "")
+        show_help
+        ;;
+    *)
+        print_status "error" "未知命令: $1"
+        print_status "info" "使用 '$0 help' 查看帮助信息"
+        exit 1
+        ;;
+esac
