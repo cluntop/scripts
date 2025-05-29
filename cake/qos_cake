@@ -145,6 +145,28 @@ check_cake() {
     printf "${GREEN}✅ CAKE 支持已确认${NC}\n"
 }
 
+# 检查现有配置
+check_existing_config() {
+    local wan_if="$1"
+    
+    # 检查是否已经配置了 CAKE
+    if tc qdisc show dev "$wan_if" | grep -q "qdisc cake"; then
+        printf "${YELLOW}⚠️  检测到现有 CAKE 配置${NC}\n"
+        printf "是否停止现有配置并重新配置? (y/n): "
+        read confirm
+        case "$confirm" in
+            [Yy]|[Yy][Ee][Ss]) 
+                stop_qos
+                sleep 1
+                ;;
+            *) 
+                printf "${RED}❌ 配置已取消${NC}\n"
+                exit 0
+                ;;
+        esac
+    fi
+}
+
 # 启动 CAKE QoS
 start_qos() {
     load_config
@@ -157,36 +179,79 @@ start_qos() {
         exit 1
     fi
     
+    # 检查现有配置
+    check_existing_config "$WAN_IF"
+    
     printf "${GREEN}🍰 启动 CAKE QoS (PPPoE 优化)${NC}\n"
     printf "接口: %s | 上传: %s Kbps | 下载: %s Kbps\n" "$WAN_IF" "$UPLOAD_KBPS" "$DOWNLOAD_KBPS"
     
-    # 清理现有配置
-    tc qdisc del dev "$WAN_IF" root 2>/dev/null
-    tc qdisc del dev "$WAN_IF" ingress 2>/dev/null
-    tc qdisc del dev ifb0 root 2>/dev/null
-    ip link del ifb0 2>/dev/null
+    # 简化清理 - 只清理必要的配置
+    printf "${YELLOW}正在清理现有队列配置...${NC}\n"
     
-    # 上传队列 - CAKE 自动调优，只需核心参数
-    tc qdisc add dev "$WAN_IF" root cake \
+    # 清理现有队列（安静模式，忽略错误）
+    tc qdisc del dev "$WAN_IF" root 2>/dev/null || true
+    tc qdisc del dev "$WAN_IF" ingress 2>/dev/null || true
+    
+    # 清理可能存在的 IFB 设备
+    if ip link show ifb0 >/dev/null 2>&1; then
+        tc qdisc del dev ifb0 root 2>/dev/null || true
+        ip link set dev ifb0 down 2>/dev/null || true
+        ip link del ifb0 2>/dev/null || true
+    fi
+    
+    # 上传队列 - CAKE 配置
+    printf "${GREEN}配置上传队列...${NC}\n"
+    if ! tc qdisc add dev "$WAN_IF" root cake \
         bandwidth "${UPLOAD_KBPS}kbit" \
         diffserv4 \
         nat \
         ack-filter \
-        overhead 18
+        overhead 18; then
+        printf "${RED}❌ 上传队列配置失败${NC}\n"
+        exit 1
+    fi
     
-    # 下载队列 - 使用 IFB
-    modprobe ifb
-    ip link add name ifb0 type ifb 2>/dev/null
-    ip link set dev ifb0 up
-    tc qdisc add dev "$WAN_IF" ingress
-    tc filter add dev "$WAN_IF" parent ffff: protocol all u32 match u32 0 0 flowid 1:1 action mirred egress redirect dev ifb0
+    # 下载队列 - 简化 IFB 设置
+    printf "${GREEN}配置下载队列...${NC}\n"
     
-    tc qdisc add dev ifb0 root cake \
+    if ! lsmod | grep -q "ifb"; then
+        modprobe ifb numifbs=1 2>/dev/null || true
+    fi
+    
+    # 创建 IFB 设备
+    if ! ip link show ifb0 >/dev/null 2>&1; then
+        if ! ip link add name ifb0 type ifb 2>/dev/null; then
+            printf "${RED}❌ 无法创建 IFB 设备${NC}\n"
+            exit 1
+        fi
+    fi
+    
+    if ! ip link set dev ifb0 up; then
+        printf "${RED}❌ 无法启动 IFB 设备${NC}\n"
+        exit 1
+    fi
+    
+    # 设置入口重定向
+    if ! tc qdisc add dev "$WAN_IF" ingress; then
+        printf "${RED}❌ 无法添加入口队列${NC}\n"
+        exit 1
+    fi
+    
+    if ! tc filter add dev "$WAN_IF" parent ffff: protocol all u32 match u32 0 0 flowid 1:1 action mirred egress redirect dev ifb0; then
+        printf "${RED}❌ 无法添加重定向规则${NC}\n"
+        exit 1
+    fi
+    
+    # 配置下载队列
+    if ! tc qdisc add dev ifb0 root cake \
         bandwidth "${DOWNLOAD_KBPS}kbit" \
         diffserv4 \
         nat \
         ingress \
-        overhead 18
+        overhead 18; then
+        printf "${RED}❌ 下载队列配置失败${NC}\n"
+        exit 1
+    fi
     
     printf "${GREEN}✅ CAKE QoS 启动完成${NC}\n"
     printf "${CYAN}🎮 游戏流量将自动获得最高优先级${NC}\n"
@@ -197,12 +262,217 @@ stop_qos() {
     load_config
     printf "${YELLOW}正在停止 CAKE QoS...${NC}\n"
     
-    tc qdisc del dev "$WAN_IF" root 2>/dev/null
-    tc qdisc del dev "$WAN_IF" ingress 2>/dev/null
-    tc qdisc del dev ifb0 root 2>/dev/null
-    ip link del ifb0 2>/dev/null
+    # 简化停止逻辑，忽略所有错误
+    tc qdisc del dev "$WAN_IF" root 2>/dev/null || true
+    tc qdisc del dev "$WAN_IF" ingress 2>/dev/null || true
+    
+    # 清理 IFB 设备
+    if ip link show ifb0 >/dev/null 2>&1; then
+        tc qdisc del dev ifb0 root 2>/dev/null || true
+        ip link set dev ifb0 down 2>/dev/null || true
+        ip link del ifb0 2>/dev/null || true
+    fi
     
     printf "${GREEN}✅ CAKE QoS 已停止${NC}\n"
+}
+
+# 实时监控 CAKE 队列
+monitor_qos() {
+    load_config
+    
+    # 检查是否运行
+    if ! tc qdisc show dev "$WAN_IF" | grep -q "qdisc cake"; then
+        printf "${RED}❌ CAKE QoS 未运行${NC}\n"
+        printf "请先运行: $0 start\n"
+        exit 1
+    fi
+    
+    printf "${GREEN}🍰 CAKE QoS 实时监控${NC}\n"
+    printf "${PURPLE}═══════════════════════════════════════${NC}\n"
+    printf "${YELLOW}按 Ctrl+C 退出监控${NC}\n\n"
+    
+    # 清屏函数
+    clear_screen() {
+        printf "\033[2J\033[H"
+    }
+    
+    # 格式化字节数
+    format_bytes() {
+        local bytes=$1
+        if [ "$bytes" -gt 1073741824 ]; then
+            printf "%.2f GB" $((bytes * 100 / 1073741824))e-2
+        elif [ "$bytes" -gt 1048576 ]; then
+            printf "%.2f MB" $((bytes * 100 / 1048576))e-2
+        elif [ "$bytes" -gt 1024 ]; then
+            printf "%.2f KB" $((bytes * 100 / 1024))e-2
+        else
+            printf "%d B" "$bytes"
+        fi
+    }
+    
+    # 获取 CAKE 统计信息
+    get_cake_stats() {
+        local device=$1
+        local direction=$2
+        local stats=$(tc -s qdisc show dev "$device" | grep -A 20 "qdisc cake")
+        
+        if [ -n "$stats" ]; then
+            # 解析统计信息
+            local sent=$(echo "$stats" | grep "Sent" | awk '{print $2}')
+            local dropped=$(echo "$stats" | grep "dropped" | awk '{print $6}' | sed 's/,//')
+            local overlimits=$(echo "$stats" | grep "overlimits" | awk '{print $8}')
+            local requeues=$(echo "$stats" | grep "requeues" | awk '{print $10}')
+            
+            printf "${CYAN}%s 队列状态:${NC}\n" "$direction"
+            printf "  📦 发送: %s 字节\n" "$(format_bytes ${sent:-0})"
+            printf "  🗑️  丢包: %s 个\n" "${dropped:-0}"
+            printf "  ⚠️  超限: %s 次\n" "${overlimits:-0}"
+            printf "  🔄 重排: %s 次\n" "${requeues:-0}"
+            
+            # 获取 CAKE 特有统计
+            local cake_info=$(echo "$stats" | grep -E "(memory|drops|marks|ack_drop)")
+            if [ -n "$cake_info" ]; then
+                printf "  🧠 内存: $(echo "$cake_info" | grep "memory" | awk '{print $2}' || echo "N/A")\n"
+                printf "  🚫 ACK丢弃: $(echo "$cake_info" | grep "ack_drop" | awk '{print $2}' || echo "N/A")\n"
+            fi
+            echo
+        fi
+    }
+    
+    # 获取流分类信息
+    get_flow_stats() {
+        local device=$1
+        local direction=$2
+        local stats=$(tc -s class show dev "$device" 2>/dev/null)
+        
+        if [ -n "$stats" ]; then
+            printf "${CYAN}%s 流量分类:${NC}\n" "$direction"
+            
+            # 解析 DiffServ4 类别
+            echo "$stats" | while IFS= read -r line; do
+                case "$line" in
+                    *"class cake 1:1"*) printf "  🎮 语音/游戏: " ;;
+                    *"class cake 1:2"*) printf "  📹 视频流: " ;;
+                    *"class cake 1:3"*) printf "  🌐 普通流量: " ;;
+                    *"class cake 1:4"*) printf "  📦 批量下载: " ;;
+                    *"Sent "*) 
+                        local sent=$(echo "$line" | awk '{print $2}')
+                        local packets=$(echo "$line" | awk '{print $4}')
+                        printf "%s (%s 包)\n" "$(format_bytes ${sent:-0})" "${packets:-0}"
+                        ;;
+                esac
+            done
+            echo
+        fi
+    }
+    
+    # 主监控循环
+    while true; do
+        clear_screen
+        
+        # 标题和时间
+        printf "${GREEN}🍰 CAKE QoS 实时监控${NC} - %s\n" "$(date '+%H:%M:%S')"
+        printf "${PURPLE}═══════════════════════════════════════${NC}\n"
+        printf "接口: ${CYAN}%s${NC} | 上传限制: ${YELLOW}%s Kbps${NC} | 下载限制: ${YELLOW}%s Kbps${NC}\n\n" \
+               "$WAN_IF" "$UPLOAD_KBPS" "$DOWNLOAD_KBPS"
+        
+        # 上传统计
+        get_cake_stats "$WAN_IF" "上传"
+        get_flow_stats "$WAN_IF" "上传"
+        
+        # 下载统计（如果 IFB 存在）
+        if ip link show ifb0 >/dev/null 2>&1; then
+            get_cake_stats "ifb0" "下载"
+            get_flow_stats "ifb0" "下载"
+        fi
+        
+        # 网络延迟测试
+        printf "${CYAN}网络延迟测试:${NC}\n"
+        if command -v ping >/dev/null 2>&1; then
+            local ping_result=$(ping -c 1 -W 1 8.8.8.8 2>/dev/null | grep "time=" | awk -F'time=' '{print $2}' | awk '{print $1}')
+            if [ -n "$ping_result" ]; then
+                printf "  🌐 延迟: %s ms\n" "$ping_result"
+            else
+                printf "  🌐 延迟: 测试失败\n"
+            fi
+        else
+            printf "  🌐 延迟: ping 命令不可用\n"
+        fi
+        echo
+        
+        # 系统负载
+        if [ -f "/proc/loadavg" ]; then
+            local load=$(cat /proc/loadavg | awk '{print $1}')
+            printf "${CYAN}系统状态:${NC}\n"
+            printf "  💻 负载: %s\n" "$load"
+        fi
+        
+        printf "\n${YELLOW}⚡ 刷新间隔: 2秒 | 按 Ctrl+C 退出${NC}\n"
+        
+        sleep 2
+    done
+}
+
+# 显示详细统计
+show_detailed_stats() {
+    load_config
+    
+    printf "${GREEN}🍰 CAKE QoS 详细统计${NC}\n"
+    printf "${PURPLE}═══════════════════════════════════════${NC}\n\n"
+    
+    # 检查是否运行
+    if ! tc qdisc show dev "$WAN_IF" | grep -q "qdisc cake"; then
+        printf "${RED}❌ CAKE QoS 未运行${NC}\n"
+        return 1
+    fi
+    
+    printf "${CYAN}📊 上传队列详细信息:${NC}\n"
+    tc -s -d qdisc show dev "$WAN_IF"
+    echo
+    
+    printf "${CYAN}📊 上传队列类别统计:${NC}\n"
+    tc -s class show dev "$WAN_IF" 2>/dev/null || printf "无类别信息\n"
+    echo
+    
+    if ip link show ifb0 >/dev/null 2>&1; then
+        printf "${CYAN}📊 下载队列详细信息:${NC}\n"
+        tc -s -d qdisc show dev ifb0
+        echo
+        
+        printf "${CYAN}📊 下载队列类别统计:${NC}\n"
+        tc -s class show dev ifb0 2>/dev/null || printf "无类别信息\n"
+        echo
+    fi
+}
+
+# 重置统计数据
+reset_stats() {
+    load_config
+    
+    printf "${YELLOW}正在重置 CAKE 统计数据...${NC}\n"
+    
+    # 重启队列以重置统计
+    if tc qdisc show dev "$WAN_IF" | grep -q "qdisc cake"; then
+        printf "重置上传队列统计...\n"
+        tc qdisc replace dev "$WAN_IF" root cake \
+            bandwidth "${UPLOAD_KBPS}kbit" \
+            diffserv4 \
+            nat \
+            ack-filter \
+            overhead 18
+    fi
+    
+    if ip link show ifb0 >/dev/null 2>&1; then
+        printf "重置下载队列统计...\n"
+        tc qdisc replace dev ifb0 root cake \
+            bandwidth "${DOWNLOAD_KBPS}kbit" \
+            diffserv4 \
+            nat \
+            ingress \
+            overhead 18
+    fi
+    
+    printf "${GREEN}✅ 统计数据已重置${NC}\n"
 }
 
 # 显示状态
@@ -240,12 +510,15 @@ show_help() {
     printf "${PURPLE}═══════════════════════════════════════${NC}\n\n"
     
     printf "${CYAN}命令:${NC}\n"
-    printf "  start    - 启动 CAKE QoS\n"
-    printf "  stop     - 停止 CAKE QoS\n"
-    printf "  restart  - 重启 CAKE QoS\n"
-    printf "  status   - 显示运行状态\n"
-    printf "  config   - 重新配置\n"
-    printf "  help     - 显示帮助\n\n"
+    printf "  start       - 启动 CAKE QoS\n"
+    printf "  stop        - 停止 CAKE QoS\n"
+    printf "  restart     - 重启 CAKE QoS\n"
+    printf "  status      - 显示运行状态\n"
+    printf "  monitor     - 实时监控界面\n"
+    printf "  stats       - 显示详细统计\n"
+    printf "  reset       - 重置统计数据\n"
+    printf "  config      - 重新配置\n"
+    printf "  help        - 显示帮助\n\n"
     
     printf "${CYAN}特性:${NC}\n"
     printf "  ✅ 专为 PPPoE 连接优化\n"
@@ -275,6 +548,15 @@ case "$1" in
         ;;
     "status")
         show_status
+        ;;
+    "monitor")
+        monitor_qos
+        ;;
+    "stats")
+        show_detailed_stats
+        ;;
+    "reset")
+        reset_stats
         ;;
     "config")
         setup_config
