@@ -1,5 +1,5 @@
 ```bash
-curl -skLo /usr/bin/qos https://github.com/cluntop/qos_script/raw/main/qos && chmod +x /usr/bin/qos && qos
+curl -skLo /usr/bin/qos https://github.com/cluntop/scripts/raw/main/qos && chmod +x /usr/bin/qos && qos
 ```
 ## cake
 ```bash
